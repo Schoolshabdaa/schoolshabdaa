@@ -884,26 +884,24 @@
     });
 
     // ─────────────────────────────────────────
-    // STRICT ZERO-BASELINE TELEMETRY
+    // GLOBAL CLOUD-SYNCED TELEMETRY (REAL-TIME ACROSS ALL BROWSERS)
     // ─────────────────────────────────────────
-    // Clean legacy test keys
-    ['schoolshabdaa_live_stats_duo_v1', 'schoolshabdaa_live_stats_ultimate_v2', 'schoolshabdaa_live_counts_v1'].forEach(k => {
-      try { localStorage.removeItem(k); } catch(e) {}
-    });
-
-    const STORAGE_KEY = 'schoolshabdaa_fullscreen_v1';
+    const CLOUD_API_BASE = 'https://abacus.jasoncameron.dev';
+    const CLOUD_NAMESPACE = 'schoolshabdaa_live_v2';
     const SUBMITTED_KEY = 'schoolshabdaa_fullscreen_subs_v1';
+    const LOCAL_CACHE_KEY = 'schoolshabdaa_cloud_cache_v1';
 
-    function getCounts() {
-      const saved = localStorage.getItem(STORAGE_KEY);
-      if (saved) {
-        try {
-          const parsed = JSON.parse(saved);
-          if (typeof parsed.schools === 'number') return parsed;
-        } catch(e) {}
+    let globalCounts = { schools: 0, parents: 0 };
+    let isInitialSyncDone = false;
+
+    // Load initial local cache for instant zero-flicker render
+    try {
+      const cached = localStorage.getItem(LOCAL_CACHE_KEY);
+      if (cached) {
+        const parsed = JSON.parse(cached);
+        if (typeof parsed.schools === 'number') globalCounts = parsed;
       }
-      return { schools: 0, parents: 0 };
-    }
+    } catch(e) {}
 
     function getSubmissions() {
       const saved = localStorage.getItem(SUBMITTED_KEY);
@@ -911,11 +909,6 @@
         try { return JSON.parse(saved); } catch(e) {}
       }
       return { school: false, parent: false };
-    }
-
-    function saveCounts(counts) {
-      try { localStorage.setItem(STORAGE_KEY, JSON.stringify(counts)); } catch(e) {}
-      updateUI(counts, true);
     }
 
     function updateUI(counts, animate = false) {
@@ -934,11 +927,19 @@
       }
 
       if (schoolStatus) {
-        schoolStatus.textContent = counts.schools > 0 ? 'Verified response registered' : 'Awaiting verified responses';
+        schoolStatus.textContent = counts.schools > 0 
+          ? (counts.schools === 1 ? '1 verified response registered' : counts.schools.toLocaleString('en-IN') + ' verified responses registered')
+          : 'Awaiting verified responses';
       }
       if (parentStatus) {
-        parentStatus.textContent = counts.parents > 0 ? 'Verified response registered' : 'Awaiting verified responses';
+        parentStatus.textContent = counts.parents > 0 
+          ? (counts.parents === 1 ? '1 verified response registered' : counts.parents.toLocaleString('en-IN') + ' verified responses registered')
+          : 'Awaiting verified responses';
       }
+
+      try {
+        localStorage.setItem(LOCAL_CACHE_KEY, JSON.stringify(counts));
+      } catch(e) {}
     }
 
     function triggerBump(el) {
@@ -960,9 +961,46 @@
       }
     }
 
-    function registerVerifiedSubmission(type) {
+    async function fetchGlobalCounts() {
+      try {
+        const [schoolsRes, parentsRes] = await Promise.all([
+          fetch(CLOUD_API_BASE + '/get/' + CLOUD_NAMESPACE + '/schools').then(r => r.json()).catch(() => null),
+          fetch(CLOUD_API_BASE + '/get/' + CLOUD_NAMESPACE + '/parents').then(r => r.json()).catch(() => null)
+        ]);
+
+        let schoolsVal = (schoolsRes && typeof schoolsRes.value === 'number') ? schoolsRes.value : 0;
+        let parentsVal = (parentsRes && typeof parentsRes.value === 'number') ? parentsRes.value : 0;
+
+        // Auto-migration: if this device already had a verified local submission from earlier test
+        // and cloud is at 0, sync it up to the global cloud automatically once
+        const subs = getSubmissions();
+        if (!isInitialSyncDone) {
+          isInitialSyncDone = true;
+          if (subs.school && schoolsVal === 0) {
+            try {
+              const res = await fetch(CLOUD_API_BASE + '/hit/' + CLOUD_NAMESPACE + '/schools').then(r => r.json());
+              if (res && typeof res.value === 'number') schoolsVal = res.value;
+            } catch(e) {}
+          }
+          if (subs.parent && parentsVal === 0) {
+            try {
+              const res = await fetch(CLOUD_API_BASE + '/hit/' + CLOUD_NAMESPACE + '/parents').then(r => r.json());
+              if (res && typeof res.value === 'number') parentsVal = res.value;
+            } catch(e) {}
+          }
+        }
+
+        const prevTotal = globalCounts.schools + globalCounts.parents;
+        const newTotal = schoolsVal + parentsVal;
+        globalCounts = { schools: schoolsVal, parents: parentsVal };
+        updateUI(globalCounts, newTotal > prevTotal && prevTotal > 0);
+      } catch(err) {
+        console.warn('Global count sync error:', err);
+      }
+    }
+
+    async function registerVerifiedSubmission(type) {
       const subs = getSubmissions();
-      const counts = getCounts();
 
       if (type === 'school') {
         if (subs.school) {
@@ -970,22 +1008,49 @@
           return;
         }
         subs.school = true;
-        counts.schools += 1;
-        localStorage.setItem(SUBMITTED_KEY, JSON.stringify(subs));
-        saveCounts(counts);
-        showToast('✓ Submission Verified!', 'Thank you! School Leader response added to the verified research count.');
+        try { localStorage.setItem(SUBMITTED_KEY, JSON.stringify(subs)); } catch(e) {}
+        updateButtonStates();
+
+        // Optimistic UI update
+        globalCounts.schools += 1;
+        updateUI(globalCounts, true);
+        showToast('✓ Submission Recorded!', 'Thank you! School Leader response added to the live global count.');
+
+        // Sync to global cloud backend
+        try {
+          const res = await fetch(CLOUD_API_BASE + '/hit/' + CLOUD_NAMESPACE + '/schools').then(r => r.json());
+          if (res && typeof res.value === 'number') {
+            globalCounts.schools = res.value;
+            updateUI(globalCounts, false);
+          }
+        } catch(e) {
+          console.error('Cloud sync hit failed:', e);
+        }
       } else if (type === 'parent') {
         if (subs.parent) {
           showToast('Already Counted', 'Your Parent submission has already been registered on this device.');
           return;
         }
         subs.parent = true;
-        counts.parents += 1;
-        localStorage.setItem(SUBMITTED_KEY, JSON.stringify(subs));
-        saveCounts(counts);
-        showToast('✓ Submission Verified!', 'Thank you! Parent response added to the verified research count.');
+        try { localStorage.setItem(SUBMITTED_KEY, JSON.stringify(subs)); } catch(e) {}
+        updateButtonStates();
+
+        // Optimistic UI update
+        globalCounts.parents += 1;
+        updateUI(globalCounts, true);
+        showToast('✓ Submission Recorded!', 'Thank you! Parent response added to the live global count.');
+
+        // Sync to global cloud backend
+        try {
+          const res = await fetch(CLOUD_API_BASE + '/hit/' + CLOUD_NAMESPACE + '/parents').then(r => r.json());
+          if (res && typeof res.value === 'number') {
+            globalCounts.parents = res.value;
+            updateUI(globalCounts, false);
+          }
+        } catch(e) {
+          console.error('Cloud sync hit failed:', e);
+        }
       }
-      updateButtonStates();
     }
 
     function updateButtonStates() {
@@ -1007,9 +1072,15 @@
 
     window.registerVerifiedSubmission = registerVerifiedSubmission;
 
-    // Initialize UI
-    updateUI(getCounts());
+    // Initial render from local cache
+    updateUI(globalCounts);
     updateButtonStates();
+
+    // Fetch live global numbers from cloud immediately
+    fetchGlobalCounts();
+
+    // Real-time live polling every 15 seconds across all visitors
+    setInterval(fetchGlobalCounts, 15000);
   </script>
 </body>
 </html>
